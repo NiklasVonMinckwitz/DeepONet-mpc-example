@@ -38,40 +38,45 @@ def ode_constructor(cheb_coeff, max_t):
 # plt.show()
 
 #%%
-N_TEST = 3
-MAX_T = 2
+def create_data(size: int, max_t: float):
+    data = []
+    for i in range(size):
+        cheb_coeff = 3*(np.random.rand(20) - 0.5)
+        # plt.scatter(sensors, cheb_smpl)
+        # plt.show()
 
-train_data = []
+        ode = ode_constructor(cheb_coeff, max_t)
+        t_fixed = np.linspace(0, 2, 100)
+        sol = sc.integrate.solve_ivp(ode, [0,max_t], [100, 30], method="RK45", t_eval=t_fixed)
 
-for i in range(N_TEST):
-    cheb_coeff = 3*(np.random.rand(20) - 0.5)
-    cheb_smpl = np.polynomial.chebyshev.chebval(sensors, cheb_coeff)
-    # plt.scatter(sensors, cheb_smpl)
-    # plt.show()
+        data.append({"cheb_coeff": cheb_coeff, "out": sol.y, "t": sol.t})
 
-    ode = ode_constructor(cheb_smpl, MAX_T)
-    integrator = sc.integrate.RK45(ode, 0, [100, 30],MAX_T)
-    out = []
-    t_out = []
-
-    t_fixed = np.linspace(0, 2, 100)
-
-    while integrator.status != "finished":
-        integrator.step()
-        out.append(integrator.y)
-        t_out.append(integrator.t)
-
-    out = np.array(out)
-    t_out = np.array(t_out)
-    print(out.shape)
-    print(t_out.shape)
-
-    f1 = sc.interpolate.interp1d(t_out, out[:,0])  # interpoliert entlang Zeitachse
-    f2 = sc.interpolate.interp1d(t_out, out[:,1])  # interpoliert entlang Zeitachse
-    out_aligned = np.array([f1(t_fixed), f2(t_fixed)]).T
-
-    train_data.append({"cheb_coeff": cheb_coeff, "cheb_smpl": cheb_smpl, "out": out_aligned, "t": t_fixed})
+    return data
 
 
 #%%
-np.polynomial.chebyshev.chebval(1.91, cheb_coeff)
+
+train_data = create_data(100, 2)
+
+test_data = create_data(100, 2)
+
+#%%
+np.save("train.npy", train_data)
+np.save("test.npy", test_data)
+print("Saved data to train.npy and test.npy")
+#%%
+X_train = (np.array([d["cheb_coeff"] for d in train_data], dtype=np.float32), np.float32(train_data[0]["t"]).reshape(-1,1))
+y_train = np.array([d["out"][0] for d in train_data], dtype=np.float32)
+
+X_test = (np.array([d["cheb_coeff"] for d in test_data], dtype=np.float32), np.float32(test_data[0]["t"]).reshape(-1,1))
+y_test = np.array([d["out"][0] for d in test_data], dtype=np.float32)
+
+data = dd.data.TripleCartesianProd(X_train, y_train, X_test, y_test)
+
+#%%
+net = dd.nn.DeepONetCartesianProd([20, 40, 40], [1,40,40], "relu", "Glorot normal")
+
+#%%
+model = dd.Model(data, net)
+model.compile("adam", lr=0.001, metrics=["l2 relative error"])
+losshistory, train_state = model.train(epochs=40000)
