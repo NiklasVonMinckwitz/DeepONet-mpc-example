@@ -1,0 +1,10 @@
+[project]
+name = "physicsai"
+version = "0.1.0"
+requires-python = ">=3.12"
+dependencies = [
+    "deepxde==1.15.0",
+    "lets-plot==4.9.0",
+    "scipy-stubs~=1.17.1",
+    "torch==2.11.0",
+]
