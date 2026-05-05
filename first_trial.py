@@ -1,3 +1,4 @@
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
 import numpy as np
 import deepxde as dd
 import scipy as sc
@@ -30,53 +31,131 @@ def ode_constructor(cheb_coeff, max_t):
 
     return microgrid_ode
 
+class OdeCallable:
+    def __init__(self, cheb_coeff, max_t):
+        self.cheb_coeff = cheb_coeff
+        self.max_t = max_t
 
-# plt.scatter(range(N), out[:,0], label="e_ss")
-# plt.scatter(range(N), out[:,1], label="p_ss")
-# plt.scatter(range(N), out[:,2], label="p_d")
-# plt.legend()
-# plt.show()
+    def __call__(self, t, y):
+        return ode_constructor(self.cheb_coeff, self.max_t)(t, y)
+
+def _single_creation(args):
+    max_t, seed = args
+    rng = np.random.default_rng(seed)
+    # Realistic Chebyshev coefficients: smooth decay + noise
+    # This produces curves with base load + 1-2 peaks, like real power demand
+    cheb_coeff = rng.normal(0, 1, 20) / np.arange(1, 21) * 20
+    x = 5*np.polynomial.chebyshev.chebval(sensors, cheb_coeff)
+
+    ode = OdeCallable(cheb_coeff, max_t)
+    t_fixed = np.linspace(0, max_t, 100)
+    sol = sc.integrate.solve_ivp(ode, [0, max_t], [100, 30], method="RK45", t_eval=t_fixed)
+    return {"in": x, "cheb_coeff": cheb_coeff, "out": sol.y, "t": sol.t}
 
 #%%
-def create_data(size: int, max_t: float):
-    data = []
-    for i in range(size):
-        cheb_coeff = 3*(np.random.rand(20) - 0.5)
-        # plt.scatter(sensors, cheb_smpl)
-        # plt.show()
+def create_data(size: int, max_t: float, workers: int = 8, mode: str = "process"):
+    seeds = range(size)
+    args = [(max_t, s) for s in seeds]
 
-        ode = ode_constructor(cheb_coeff, max_t)
-        t_fixed = np.linspace(0, 2, 100)
-        sol = sc.integrate.solve_ivp(ode, [0,max_t], [100, 30], method="RK45", t_eval=t_fixed)
+    Executor = ProcessPoolExecutor if mode == "process" else ThreadPoolExecutor
 
-        data.append({"cheb_coeff": cheb_coeff, "out": sol.y, "t": sol.t})
+    with Executor(max_workers=workers) as pool:
+        data = list(pool.map(_single_creation , args, chunksize=max(1, size // workers)))
 
     return data
 
-
 #%%
 
-train_data = create_data(100, 2)
-
-test_data = create_data(100, 2)
+data = create_data(1200, 2, workers=12)
+# train_data = np.load("./train.npy", allow_pickle=True)
 
 #%%
-np.save("train.npy", train_data)
-np.save("test.npy", test_data)
+np.save("data.npy", data)
 print("Saved data to train.npy and test.npy")
 #%%
-X_train = (np.array([d["cheb_coeff"] for d in train_data], dtype=np.float32), np.float32(train_data[0]["t"]).reshape(-1,1))
-y_train = np.array([d["out"][0] for d in train_data], dtype=np.float32)
+X_train = (np.array([d["in"] for d in data[:500]], dtype=np.float32), np.float32(data[0]["t"]).reshape(-1,1))
+y_train = np.array([d["out"][0] for d in data[:500]], dtype=np.float32)
 
-X_test = (np.array([d["cheb_coeff"] for d in test_data], dtype=np.float32), np.float32(test_data[0]["t"]).reshape(-1,1))
-y_test = np.array([d["out"][0] for d in test_data], dtype=np.float32)
+X_test = (np.array([d["in"] for d in data[500:]], dtype=np.float32), np.float32(data[0]["t"]).reshape(-1,1))
+y_test = np.array([d["out"][0] for d in data[500:]], dtype=np.float32)
 
 data = dd.data.TripleCartesianProd(X_train, y_train, X_test, y_test)
 
 #%%
-net = dd.nn.DeepONetCartesianProd([20, 40, 40], [1,40,40], "relu", "Glorot normal")
+net = dd.nn.DeepONetCartesianProd([100, 40, 40], [1,40], "relu", "Glorot normal")
 
 #%%
 model = dd.Model(data, net)
 model.compile("adam", lr=0.001, metrics=["l2 relative error"])
-losshistory, train_state = model.train(epochs=40000)
+losshistory, train_state = model.train(epochs=70000)
+
+#%%
+print(X_test.shape)
+
+#%%
+# Example evaluation and plotting
+
+# Predict on test data
+y_pred = model.predict(X_test)
+
+# Compute test L2 relative error
+test_error = np.linalg.norm(y_test - y_pred) / np.linalg.norm(y_test)
+print(f"Test L2 relative error: {test_error:.6f}")
+
+# Plot true vs predicted for first 5 test samples
+fig, axes = plt.subplots(5, 1, figsize=(10, 12))
+for i in range(5):
+    axes[i].plot(X_test[1].flatten(), y_test[:, i], label="True solution", linewidth=2)
+    axes[i].plot(X_test[1].flatten(), y_pred[:, i], label="Predicted solution", linewidth=2, linestyle="--")
+    axes[i].set_ylabel(f"Sample {i+1}")
+    axes[i].legend()
+    axes[i].grid(True, alpha=0.3)
+axes[-1].set_xlabel("Time")
+plt.suptitle("DeepONet: True vs Predicted Solutions (Test Samples)")
+plt.tight_layout()
+plt.savefig("prediction_comparison.png", dpi=150)
+plt.show()
+print("Saved prediction comparison plot to prediction_comparison.png")
+
+#%%
+# Realistic curve test case: daily power demand profile
+def realistic_demand(t):
+    """Simulated daily microgrid power demand (normalized)."""
+    # Base load + morning/evening peaks
+    base = 0.3
+    morning = 0.4 * np.exp(-((t/2 - 0.3) ** 2) / 0.005)
+    evening = 0.5 * np.exp(-((t/2 - 0.75) ** 2) / 0.008)
+    return 5*(base + morning + evening)
+
+# Convert realistic curve to Chebyshev coefficients (20 terms)
+t_norm = np.linspace(0, 1, 500)
+realistic_vals = realistic_demand(t_norm)
+cheb_coeffs_raw = np.polynomial.chebyshev.chebfit(t_norm, realistic_vals, 19)
+realistic_vals_at_sensor = realistic_demand(sensors)
+
+# Solve the true ODE with realistic input
+ode_realistic = OdeCallable(cheb_coeffs_raw, 2)
+t_eval = np.linspace(0, 2, 200)
+sol_true = sc.integrate.solve_ivp(ode_realistic, [0, 2], [100, 30], method="RK45", t_eval=t_eval)
+y_true_realistic = sol_true.y[0]
+
+# Predict with trained DeepONet
+X_realistic = (realistic_vals_at_sensor.reshape(1, -1), t_eval.reshape(-1, 1))
+y_pred_realistic = model.predict(X_realistic)[0]
+
+# Plot comparison
+plt.figure(figsize=(12, 5))
+plt.plot(t_eval, y_true_realistic, label="True (IVP solve)", linewidth=2.5)
+plt.plot(t_eval, y_pred_realistic, label="Predicted (DeepONet)", linewidth=2.5, linestyle="--")
+plt.plot(t_eval, realistic_demand(t_eval), label="Load", linewidth=2.5)
+plt.xlabel("Time")
+plt.ylabel("e_ss (State of Charge)")
+plt.title("Realistic Demand: True vs Predicted")
+plt.legend()
+plt.grid(True, alpha=0.3)
+plt.tight_layout()
+plt.show()
+
+# Compute error for realistic case
+# realistic_error = np.linalg.norm(y_true_realistic - y_pred_realistic) / np.linalg.norm(y_true_realistic)
+# print(f"Realistic case L2 relative error: {realistic_error:.6f}")
